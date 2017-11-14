@@ -1,8 +1,11 @@
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell     #-}
 -- | Executor for external tasks.
 module Control.FunFlow.External.Executor where
 
-import           Control.Exception                    (IOException, try)
+import           Control.Exception                    (IOException, bracket,
+                                                       try)
 import qualified Control.FunFlow.ContentStore         as CS
 import           Control.FunFlow.External
 import           Control.FunFlow.External.Coordinator
@@ -11,11 +14,13 @@ import           Control.Monad                        (forever)
 import           Control.Monad.IO.Class               (liftIO)
 import           Control.Monad.Trans.Maybe
 import qualified Data.Text                            as T
+import           Katip                                as K
 import           Network.HostName
 import           System.Clock
 import           System.Exit                          (ExitCode (..))
 import           System.FilePath                      ((</>))
-import           System.IO                            (IOMode (..), openFile)
+import           System.IO                            (IOMode (..), openFile,
+                                                       stdout)
 import           System.Posix.Env                     (getEnv)
 import           System.Posix.User
 import           System.Process
@@ -35,7 +40,7 @@ data ExecutionResult =
     --   TODO where should logs go?
   | Failure TimeSpec Int
 
--- | Execute an individual task.
+  -- | Execute an individual task.
 execute :: CS.ContentStore -> TaskDescription -> IO ExecutionResult
 execute store td = do
   instruction <- CS.constructIfMissing store (td ^. tdOutput)
@@ -54,8 +59,8 @@ execute store td = do
         convParam = ConvParam
           { convPath = pure . CS.itemPath
           , convEnv = \e -> T.pack <$> MaybeT (getEnv $ T.unpack e)
-          , convUid = liftIO $ getEffectiveUserID
-          , convGid = liftIO $ getEffectiveGroupID
+          , convUid = liftIO getEffectiveUserID
+          , convGid = liftIO getEffectiveGroupID
           , convOut = pure fp
           }
       in do
@@ -63,11 +68,11 @@ execute store td = do
           traverse (paramToText convParam) (td ^. tdTask . etParams)
         params <- case mbParams of
           -- XXX: Should we block here?
-          Nothing -> fail "A parameter was not ready"
+          Nothing     -> fail "A parameter was not ready"
           Just params -> return params
 
         out <-
-          if (td ^. tdTask . etWriteToStdOut)
+          if td ^. tdTask . etWriteToStdOut
           then UseHandle <$> openFile (fp </> "out") WriteMode
           else return Inherit
 
@@ -100,22 +105,30 @@ executeLoop :: forall c. Coordinator c
             -> FilePath
             -> IO ()
 executeLoop _ cfg sroot = do
-  hook :: Hook c <- initialise cfg
-  executor <- Executor <$> getHostName
+  handleScribe <- mkHandleScribe ColorIfTerminal stdout InfoS V2
+  let mkLogEnv = registerScribe "stdout" handleScribe defaultScribeSettings =<< initLogEnv "FFExecutorD" "production"
+  bracket mkLogEnv closeScribes $ \le -> do
+    let initialContext = ()
+        initialNamespace = "executeLoop"
 
-  -- Types of completion/status updates
-  let fromCache = Completed $ ExecutionInfo executor 0
-      afterTime t = Completed $ ExecutionInfo executor t
-      afterFailure t i = Failed (ExecutionInfo executor t) i
+    runKatipContextT le initialContext initialNamespace $ do
+      $(logTM) InfoS "Initialising connection to coordinator."
+      hook :: Hook c <- liftIO $ initialise cfg
+      executor <- liftIO $ Executor <$> getHostName
 
-  CS.withStore sroot $ \store -> forever $ do
-    mtask <- popTask hook executor
-    case mtask of
-      Nothing -> return ()
-      Just task -> do
-        res <- execute store task
-        case res of
-          Cached      -> updateTaskStatus hook (task ^. tdOutput) fromCache
-          Success t   -> updateTaskStatus hook (task ^. tdOutput) $ afterTime t
-          Failure t i -> updateTaskStatus hook (task ^. tdOutput) $ afterFailure t i
-          AlreadyRunning -> return ()
+      -- Types of completion/status updates
+      let fromCache = Completed $ ExecutionInfo executor 0
+          afterTime t = Completed $ ExecutionInfo executor t
+          afterFailure t i = Failed (ExecutionInfo executor t) i
+
+      liftIO $ CS.withStore sroot $ \store -> forever $ do
+        mtask <- popTask hook executor
+        case mtask of
+          Nothing -> return ()
+          Just task -> do
+            res <- execute store task
+            case res of
+              Cached      -> updateTaskStatus hook (task ^. tdOutput) fromCache
+              Success t   -> updateTaskStatus hook (task ^. tdOutput) $ afterTime t
+              Failure t i -> updateTaskStatus hook (task ^. tdOutput) $ afterFailure t i
+              AlreadyRunning -> return ()
